@@ -19,32 +19,31 @@
 #define DEFAULT_CLIENT_COUNT 4
 #define DEFAULT_PORT "27015"
 
-struct shared_data
+struct socket_info_t 
 {
-	HANDLE mutex;
-	HANDLE client_threads[DEFAULT_CLIENT_COUNT];
-	int client_count;
-	SOCKET socket_array[DEFAULT_CLIENT_COUNT];
-	
 
-	shared_data()
-	{
-		client_count = 0;
-		mutex = NULL;
-		for (int i = 0; i < DEFAULT_CLIENT_COUNT; ++i)
-		{
-			client_threads[i] = NULL;
-			socket_array[i] = INVALID_SOCKET;
-		}
-	}
+	CHAR buffer[DEFAULT_BUFLEN]{ 0 };
+	WSABUF dataBuffer;
+	SOCKET socket{ INVALID_SOCKET };
+	OVERLAPPED overlapped;
+	DWORD bytesSend{ 0 };
+	DWORD bytesReceive{ 0 };
+
 };
 
-shared_data g_shared_data;
+struct server_info_t
+{
+	int clientCount{ 0 };
+	socket_info_t* socketArray[DEFAULT_CLIENT_COUNT];
+};
+
+server_info_t g_server_info;
 
 void kill_client(int n)
 {
-	WaitForSingleObject(g_shared_data.mutex, INFINITE);
-	auto sock = g_shared_data.socket_array[n];
+	if (n > g_server_info.clientCount ||
+		!g_server_info.socketArray[n]) return;
+	auto& sock = g_server_info.socketArray[n]->socket;
 	if (sock == INVALID_SOCKET ||
 		sock == SOCKET_ERROR) return;
 	printf("shutting down client socket #%d\n", n);
@@ -53,16 +52,15 @@ void kill_client(int n)
 		printf("socket #%d still in use\n", n);
 	}
 	closesocket(sock);
-	g_shared_data.socket_array[n] = INVALID_SOCKET;
-	ReleaseMutex(g_shared_data.mutex);
+	sock = INVALID_SOCKET;
 }
 
 bool startsWith(const char* str, const char* starts)
 {
 	if (str == 0 || starts == 0) return false;
-	int length = strlen(starts);
+	auto length = strlen(starts);
 	if (strlen(str) < length) return false;
-	for (int i = 0; i < length; ++i)
+	for (auto i = 0; i < length; ++i)
 	{
 		if (str[i] != starts[i]) return false;
 	}
@@ -94,97 +92,170 @@ int readn(SOCKET sock, char* buf, int buflen, int _n)
 }
 
 
-DWORD WINAPI client_thread(void* data)
+bool create_client(SOCKET s)
 {
-	int number = *((int*)data);
-
-	int iResult, iSendResult;
-	char recvbuf[DEFAULT_BUFLEN] = { 0 };
-	int recvbuflen = DEFAULT_BUFLEN;
-
-	// Accept a client socket
-	SOCKET sock = g_shared_data.socket_array[number];
-	
-	// No longer need server socket
-	printf("%d: connected to remote user\n", number);
-	printf("%d: receiving data...\n", number);
-	// Receive until the peer shuts down the connection
-	do {
-		ZeroMemory(recvbuf, sizeof(recvbuf));
-
-		iResult = readn(sock, recvbuf, DEFAULT_BUFLEN, DEFAULT_PORTION);
-		if (iResult > 0) {
-			printf("%d: Received:'%s' (%d bytes)\n", number, recvbuf, iResult);
-
-			// Echo the buffer back to the sender
-			iSendResult = send(sock, recvbuf, iResult, 0);
-			if (iSendResult == SOCKET_ERROR) {
-				printf("%d: send back failed with error: %d\nEXITING\n", number, WSAGetLastError());
-
-				break;
-			}
-			printf("%d: Sending back:'%s' (%d bytes)\n", number, recvbuf, iSendResult);
-		}
-		else if (iResult == SOCKET_ERROR)
-		{
-			break;
-		}
-
-	} while (iResult > 0);
-
-
-	if (sock != INVALID_SOCKET)
+	if (g_server_info.clientCount >= DEFAULT_CLIENT_COUNT)
 	{
-		kill_client(number);
+		printf("too many clients error\n");
+		return false;
 	}
-
-
-	delete ((int*)data);
-
-	printf("%d: disconnected\n", number);
-	return 0;
+	auto& info = g_server_info.socketArray[g_server_info.clientCount];
+	info = static_cast<socket_info_t*>(GlobalAlloc(GPTR, sizeof(socket_info_t)));
+	if (!info)
+	{
+		printf("could not perform global allocation\n");
+		return false;
+	}
+	info->socket = s;
+	info->bytesSend = 0;
+	info->bytesReceive = 0;
+	++g_server_info.clientCount;
+	return true;
 }
 
 DWORD WINAPI listen_thread(void* data)
 {
-	SOCKET server_sock = *((SOCKET*)data);
+	SOCKET server_sock{ *static_cast<SOCKET*>(data) };
 
-	// Accept a client socket
-	int number = g_shared_data.client_count;
+	ULONG nonBlock{ 1 };
+
+	auto result = ioctlsocket(server_sock, FIONBIO, &nonBlock);
+	if (result == SOCKET_ERROR)
+	{
+		printf("ioctlsocket failure\n");
+		goto terminate;
+	}
+
 	while (true)
 	{
-		SOCKET& sock = g_shared_data.socket_array[number];
+		FD_SET writeSet;
+		FD_SET readSet;
+		FD_ZERO(&readSet);
+		FD_ZERO(&writeSet);
 
-		sock = accept(server_sock, NULL, NULL);
+		FD_SET(server_sock, &readSet);
 
-		if (sock == INVALID_SOCKET) {
-			printf("server socket failure, disconnecting clients\n");
-			break;
+		for (int i = 0; i < g_server_info.clientCount; ++i)
+		{
+			auto info = g_server_info.socketArray[i];
+			SOCKET sock = info->socket;
+
+			if (info->bytesReceive > info->bytesSend)
+			{
+				FD_SET(sock, &writeSet);
+			}
+			else
+			{
+				FD_SET(sock, &readSet);
+			}
 		}
 
-		if (number < DEFAULT_CLIENT_COUNT)
+		DWORD total = select(0, &readSet, &writeSet, nullptr, nullptr);
+		if (total == SOCKET_ERROR)
 		{
-			int* params = new int;
-			*params = number;
-			WaitForSingleObject(g_shared_data.mutex, INFINITE);
-			g_shared_data.client_threads[number] = CreateThread(NULL, 0, client_thread, params, 0, NULL);
-			ReleaseMutex(g_shared_data.mutex);
-			++number;
+			printf("socket selection failure\n");
+			goto exit;
 		}
-		else
+
+		if (FD_ISSET(server_sock, &readSet))
 		{
-			printf("warning: Could not connect new client: out of slots.\n");
+			--total;
+			auto acceptSocket = accept(server_sock, nullptr, nullptr);
+			if (acceptSocket != INVALID_SOCKET)
+			{
+				nonBlock = 1;
+
+				if (ioctlsocket(acceptSocket, FIONBIO, &nonBlock) == SOCKET_ERROR)
+				{
+					printf("socket selection accept failure\n");
+					goto exit;
+				}
+
+				create_client(acceptSocket);
+			}
+			else
+			{
+				if (WSAGetLastError() != WSAEWOULDBLOCK)
+				{
+					printf("socket select accept failure\n");
+					goto exit;
+				}
+			}
+		}
+
+		for (int i = 0; total > 0 && i < g_server_info.clientCount; ++i)
+		{
+			auto info = g_server_info.socketArray[i];
+			SOCKET sock = info->socket;
+
+			if (FD_ISSET(sock, &readSet))
+			{
+				--total;
+
+				info->dataBuffer.buf = info->buffer;
+				info->dataBuffer.len = DEFAULT_BUFLEN;
+
+				DWORD flags{ 0 };
+				DWORD recvBytes{ 0 };
+				if (WSARecv(sock, &info->dataBuffer, 1, &recvBytes, &flags, nullptr, nullptr) == SOCKET_ERROR)
+				{
+					if (WSAGetLastError() != WSAEWOULDBLOCK)
+					{
+						printf("socket select receive failure, killing client %d\n", i);
+						kill_client(i);
+					}
+					continue;
+				}
+				else
+				{
+					info->bytesReceive = recvBytes;
+					if (recvBytes == 0)
+					{
+						printf("remote user closed connection, killing client %d\n", i);
+						kill_client(i);
+						continue;
+					}
+				}
+			}
+
+			if (FD_ISSET(sock, &writeSet))
+			{
+				--total;
+
+				info->dataBuffer.buf = info->buffer + info->bytesSend;
+				info->dataBuffer.len = info->bytesReceive - info->bytesSend;
+
+				DWORD sendBytes{ 0 };
+				if (WSASend(sock, &info->dataBuffer, 1, &sendBytes, 0, nullptr, nullptr) == SOCKET_ERROR)
+				{
+					if (WSAGetLastError() != WSAEWOULDBLOCK)
+					{
+						printf("socket select send failure, killing client %d\n", i);
+						kill_client(i);
+					}
+					continue;
+				}
+				else
+				{
+					info->bytesSend += sendBytes;
+					if (info->bytesSend == info->bytesReceive)
+					{
+						info->bytesSend = 0;
+						info->bytesReceive = 0;
+					}
+				}
+			}
 		}
 	}
+
+exit:
 
 	for (int i = 0; i < DEFAULT_CLIENT_COUNT; ++i)
 	{
 		kill_client(i);
 	}
 
-	printf("waiting for client threads to finish...\n");
-
-	WaitForMultipleObjects(DEFAULT_CLIENT_COUNT, g_shared_data.client_threads, TRUE, INFINITE);
+terminate:
 
 	delete ((SOCKET*)data);
 
@@ -196,15 +267,6 @@ int main(void)
 	HANDLE lthread;
 	WSADATA wsaData;
 
-	g_shared_data.mutex = CreateMutex(NULL, FALSE, NULL);
-	if (g_shared_data.mutex == NULL)
-	{
-		printf("failed to create mutex\n");
-		return 1;
-	}
-
-	struct addrinfo *result = NULL;
-	struct addrinfo hints;
 	int iResult;
 
 	// Initialize Winsock
@@ -214,44 +276,31 @@ int main(void)
 		return 1;
 	}
 
-	ZeroMemory(&hints, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-	hints.ai_flags = AI_PASSIVE;
-
-	// Resolve the server address and port
-	iResult = getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
-	if (iResult != 0) {
-		printf("getaddrinfo failed with error: %d\n", iResult);
-		WSACleanup();
-		return 1;
-	}
-
 	// Create a SOCKET for connecting to server
-	SOCKET server_sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+	SOCKET server_sock = WSASocketW(AF_INET, SOCK_STREAM, 0, nullptr, 0, WSA_FLAG_OVERLAPPED);
 	if (server_sock == INVALID_SOCKET) {
 		printf("server socket failed with error: %ld\n", WSAGetLastError());
-		freeaddrinfo(result);
 		WSACleanup();
 		return 1;
 	}
+
+	SOCKADDR_IN InternetAddr;
+	InternetAddr.sin_family = AF_INET;
+	InternetAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	InternetAddr.sin_port = htons(27015);
 
 	// Setup the TCP listening socket
 	printf("listening for port %s...\n", DEFAULT_PORT);
-	iResult = bind(server_sock, result->ai_addr, (int)result->ai_addrlen);
+	iResult = bind(server_sock, (PSOCKADDR)&InternetAddr, sizeof(InternetAddr));
 	if (iResult == SOCKET_ERROR) {
 		printf("bind failed with error: %d\n", WSAGetLastError());
-		freeaddrinfo(result);
 		closesocket(server_sock);
 		server_sock = INVALID_SOCKET;
 		WSACleanup();
 		return 1;
 	}
 
-	freeaddrinfo(result);
-
-	iResult = listen(server_sock, SOMAXCONN);
+	iResult = listen(server_sock, 5);
 	if (iResult == SOCKET_ERROR) {
 		printf("listen failed with error: %d\n", WSAGetLastError());
 		closesocket(server_sock);
@@ -260,8 +309,10 @@ int main(void)
 		return 1;
 	}
 
+
 	SOCKET* params = new SOCKET;
 	*params = server_sock;
+
 	lthread = CreateThread(NULL, 0, listen_thread, params, 0, NULL);
 
 	char cmdbuf[DEFAULT_BUFLEN] = { 0 };
@@ -281,17 +332,15 @@ int main(void)
 		else if (strcmp(cmdbuf, "list") == 0)
 		{
 			printf("connection list:\n");
-			WaitForSingleObject(g_shared_data.mutex, INFINITE);
-			for (int i = 0; i < DEFAULT_CLIENT_COUNT; ++i)
+			for (int i = 0; i < g_server_info.clientCount; ++i)
 			{
-				auto sock = g_shared_data.socket_array[i];
+				auto sock = g_server_info.socketArray[i]->socket;
 				if (sock != INVALID_SOCKET &&
 					sock != SOCKET_ERROR)
 				{
-					printf("%d: remote user connected on socket %d\n", i, sock);
+					printf("%ld: remote user connected on socket %lld\n", i, sock);
 				}
 			}
-			ReleaseMutex(g_shared_data.mutex);
 		}
 		else if (startsWith(cmdbuf, "kill"))
 		{
@@ -318,8 +367,6 @@ int main(void)
 	closesocket(server_sock);
 
 	WaitForSingleObject(lthread, INFINITE);
-
-	CloseHandle(g_shared_data.mutex);
 
 	WSACleanup();
 

@@ -201,7 +201,7 @@ int __cdecl main(int argc, char **argv)
 	char cmd[DEFAULT_BUFLEN] = { 0 };
 	int iResult;
 
-	const char* server_name = "localhost";
+	const char* server_name = "127.0.0.1";
 
 	// Initialize Winsock
 	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);

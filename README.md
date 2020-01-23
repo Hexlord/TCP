@@ -1,1 +1,3 @@
-# TCP
+TCP client server implementations for windows and linux
+
+WARNING: buggy :)
